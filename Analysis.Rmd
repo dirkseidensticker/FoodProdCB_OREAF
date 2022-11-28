@@ -1,0 +1,608 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r LIBRARIES}
+library(c14bazAAR)
+library(concaveman)
+library(cowplot)
+library(ggplot2)
+library(ggrepel)
+library(ggsn)
+library(geojsonsf)
+library(raster)
+library(rgdal)
+library(rnaturalearth)
+library(sf)
+library(tidyr)
+library(viridis)
+```
+# Setup
+
+## define custom functions & load map data:
+
+```{r FUNCTIONS}
+rc.spd <- function(c14.data, 
+                   timeRange,
+                   oxcalnorm = FALSE, 
+                   median = FALSE){
+  
+  cal <- rcarbon::calibrate(x = c14.data$C14AGE,
+                            errors = c14.data$C14STD,
+                            calCurves = 'intcal20', 
+                            normalised = FALSE)
+
+  bins <- rcarbon::binPrep(sites = c14.data$SITE,
+                           ages = c14.data$C14AGE,
+                           h = 100)
+
+  # ckde
+  # optimal kernel (cf. McLaughlin 2018) ----
+  kernel <- density(c14.data$C14STD, 
+                    kernel = "gaussian")
+  
+  kernel.df <- data.frame(x = kernel$x, 
+                          y = kernel$y)
+  
+  kernel.val <- round(kernel.df[which.max(kernel.df$y),"x"])
+  
+  print(paste("CKDE kernel =", kernel.val))
+  
+  rand <- rcarbon::sampleDates(
+    cal, 
+    bins = bins,
+    nsim = 500)
+  
+  ckde = rcarbon::ckde(
+    rand,
+    timeRange = timeRange,
+    bw = kernel.val,
+    normalised = FALSE)
+
+  plot(ckde)
+  
+  kde <- as.data.frame(ckde$res.matrix)
+
+  kde$calBP <- as.numeric(
+    seq(timeRange[1], timeRange[2], -1)
+  )
+
+  kde$calBCAD <- 1950 - as.numeric(kde$calBP)
+  kde.melt <- reshape2::melt(kde, id.vars = c("calBCAD", "calBP"))
+  
+  kde <- kde.melt %>%
+    tidyr::drop_na() %>%
+    dplyr::group_by(calBCAD, calBP) %>%
+    dplyr::mutate(MEAN = mean(value), 
+                  LO = quantile(value, prob=0.025, na.rm=TRUE), # cf https://github.com/ahb108/rcarbon/blob/master/R/plots.R#L1915-L1916
+                  HI = quantile(value, prob=0.975, na.rm=TRUE))
+  
+  # SPD
+  spd <- rcarbon::spd(cal,
+                      timeRange = timeRange, 
+                      bins = bins, 
+                      spdnormalised = FALSE, 
+                      runm = 60) # smooth spd
+  
+  spd <- as.data.frame(spd[2])
+
+  plot(spd$grid.calBP, spd$grid.PrDens, type = 'line')
+  
+  if(oxcalnorm) {
+    # raise to max() == 1 like OxCal does!
+    spd$grid.PrDens <- spd$grid.PrDens/max(spd$grid.PrDens, 
+                                           na.rm = TRUE)
+  }
+  
+  spd <- spd[spd$grid.PrDens != 0,] # remove 0 values
+  spd$calBCAD <- 1950 - spd$grid.calBP
+
+  if(median){
+    med <- list()
+    for(k in 1:length(cal$grids)){
+      m <- 1950 - median(cal$grids[[k]]$calBP, na.rm = T)
+      med[k] <- m
+    }
+    median <- do.call(rbind, med)
+    
+    output <- list(kde = kde, 
+                   spd = spd, 
+                   median = median)
+  }else{
+    output <- list(kde = kde,
+                   spd = spd)
+  }
+}
+```
+
+## GIS
+
+```{r VECTOR, echo=FALSE}
+# Vector layers ----
+#ocean10 <- rnaturalearth::ne_download(scale = 10, type = "ocean", category = "physical", returnclass = "sf")
+#land10 <- rnaturalearth::ne_download(scale = 10, type = "land", category = "physical", returnclass = "sf")
+#rivers10 <- rnaturalearth::ne_download(scale = 10, type = "rivers_lake_centerlines", category = "physical", returnclass = "sf")
+#lakes10 <- rnaturalearth::ne_download(scale = 10, type = "lakes", category = "physical", returnclass = "sf")
+#coast10 <- rnaturalearth::ne_download(scale = 10, type = "coastline", category = "physical", returnclass = "sf")
+#boundary_lines_land10 <- rnaturalearth::ne_download(scale = 10, type = "boundary_lines_land", category = "cultural", returnclass = "sf")
+
+ocean10 <- geojsonsf::geojson_sf("input/naturalearth/ne_10m_ocean.geojson")
+land10 <- geojsonsf::geojson_sf("input/naturalearth/ne_10m_land.geojson")
+rivers10 <- geojsonsf::geojson_sf("input/naturalearth/ne_10m_rivers_lake_centerlines.geojson")
+lakes10 <- geojsonsf::geojson_sf("input/naturalearth/ne_10m_lakes.geojson")
+coast10 <- geojsonsf::geojson_sf("input/naturalearth/ne_10m_ocean.geojson")
+boundary_lines_land10 <- geojsonsf::geojson_sf("input/naturalearth/ne_10m_admin_0_boundary_lines_land.geojson")
+
+white <- sf::st_read("input/whitesveg/Whites vegetation.shp") %>%
+  st_set_crs(4326) %>%
+  dplyr::filter(DESCRIPTIO %in% c("Anthropic landscapes",
+                                  "Dry forest and thicket",
+                                  "Swamp forest and mangrove",
+                                  "Tropical lowland rainforest"))
+
+basemap <-  ggplot() + 
+  # base map ----
+  geom_sf(data = white, fill = "#DCDCDC", color = NA) + 
+  geom_sf(data = coast10, size = .5, color = '#808080', fill = NA) + 
+  geom_sf(data = rivers10, size = .5, color = '#808080', fill = NA) + 
+  geom_sf(data = lakes10, fill = '#808080', color = NA) + 
+  geom_sf(data = boundary_lines_land10, size = .1, color = 'black', fill = NA)
+```
+
+```{r}
+cng.watershed <- sf::st_read("input/af_bas_15s_beta/af_bas_15s_beta.shp") %>%
+  dplyr::filter(BASIN_ID == 108677)
+```
+
+## arch. datasets
+
+```{r C14}
+c14 <- data.table::fread("https://raw.githubusercontent.com/dirkseidensticker/aDRAC/master/aDRAC.csv", 
+                         encoding = "UTF-8") %>%
+  dplyr::filter(CLASS %in% c("Ia", "Ib", "Ic")) # only sites with reliable dates
+
+# rename for c14bazAAR
+c14$c14age <- c14$C14AGE 
+c14$c14std <- c14$C14STD 
+
+# bulk calibration
+c14 <- c14bazAAR::as.c14_date_list(c14)
+c14 <- c14bazAAR::calibrate(c14)
+
+for(i in 1:nrow(c14)){
+  li <- c14[i,"calrange"][[1]]
+  c14[i,"TO"] <- 1950 - min(li[[1]]$from, na.rm = T)
+  c14[i,"FROM"] <- 1950 - max(li[[1]]$to, na.rm = T)
+  if(as.numeric(c14[i,"FROM"]) != Inf | as.numeric(c14[i,"TO"]) != -Inf){
+    c14[i,"MEDIAN"] <- round(median(seq(from = as.numeric(c14[i,"FROM"]), to = as.numeric(c14[i,"TO"]))))
+  }
+}
+c14 <- sf::st_as_sf(c14,
+                    coords = c(
+                      "LONG", 
+                      "LAT"), 
+                    remove = FALSE,
+                    na.fail = F,
+                    crs = 4326)
+c14
+
+
+```
+
+only show dates arch. sites = excavations?
+```{r SITES}
+po.sites <- data.table::fread(
+  "https://raw.githubusercontent.com/dirkseidensticker/HumActCentralAfrica_Paper/main/input/sites.csv",
+  encoding = "UTF-8") %>%
+  dplyr::select(SITE, LAT, LONG) %>%
+  sf::st_as_sf(coords = c(
+                      "LONG", 
+                      "LAT"), 
+                    remove = FALSE,
+                    na.fail = F,
+                    crs = 4326)
+
+sites <- rbind(c14[,c("SITE", "LAT", "LONG")], 
+               po.sites)
+sites <- unique(sites)
+sites <- sites[apply(sites, 1, function(x)!any(is.na(x))), , drop=F]
+sites
+```
+
+# Fig. 1
+
+```{r}
+sites.text <- dplyr::filter(c14, SITE %in% c(
+    "Shum Laka", 
+    "Nkang", 
+    "Obobogo",
+    "Abang Minko'o",
+    "Bwambé-Sommet (Est)", 
+    "Boso-Njafo",
+    "Mintyaminyoumin", 
+    "Imbonga",
+    "Longa",
+    "Bolondo",
+    "Pikunda",
+    "Ngovo",
+    "Toube 1",
+    "Okala",
+    "Dibamba",
+    "Mbandaka",
+    "Nangara-Komba",
+    "Matangai Turu Northwest"
+    )) %>%
+  dplyr::group_by(SITE, LAT, LONG) %>%
+  dplyr::summarise()
+sites.text
+```
+
+```{r}
+library(elevatr)
+
+# setting up boundig box
+locations <- data.frame(X1 = c(5, 35), 
+                        X2 = c(10, -12))  
+
+# get gem
+dem <- elevatr::get_elev_raster(locations = locations, 
+                                prj = sf::st_crs(4326), 
+                                z = 4, 
+                                clip = "bbox")
+
+#plot(dem)
+
+dem_df <- raster::as.data.frame(dem, xy=TRUE)
+names(dem_df) <- c("x", "y", "z")
+
+dem_df <- dplyr::filter(dem_df, z >= 0)
+
+dem_df$z.class <- cut(dem_df$z, c(0, 200, 500, 1000, 2000, Inf))
+```
+
+```{r}
+dem.450 <- raster::rasterToContour(dem, levels = c(450)) %>%
+  sf::st_as_sf() %>%
+  sf::st_cast("LINESTRING") %>%
+  sf::st_crop(xmin = 14, xmax = 26, ymin = -5.25, ymax = 6) %>%
+  sf::st_cast("POLYGON") %>%
+  sf::st_make_valid() %>%
+  dplyr::mutate(area = sf::st_area(geometry)) %>%
+  dplyr::group_by(level) %>%
+  dplyr::filter(area == max(area)) %>%
+  dplyr::select(-c(level, area)) %>%
+  sf::st_union()
+
+geo <- geojsonsf::geojson_sf("input/geo7_2ag.geojson") %>%
+  dplyr::filter(GEO2_7G_ID %in% c(8447, 8633)) %>%
+  sf::st_union()
+
+library(smoothr)
+
+cb.comb <- rbind(sf::st_sf(geom = dem.450), 
+      sf::st_sf(geom = geo)) %>%
+  sf::st_make_valid() %>%
+  sf::st_union() %>%
+  sf::st_buffer(dist = .1) %>%
+  sf::st_simplify(preserveTopology = FALSE, dTolerance = 1.5) %>%
+  smoothr::smooth(method = "chaikin")
+
+ggplot() + 
+  geom_sf(data = dem.450, fill = "blue", alpha = .2) + 
+  geom_sf(data = geo, fill = "red", alpha = .2) + 
+  geom_sf(data = cb.comb, fill = "yellow", alpha = .2)
+```
+
+
+```{r MINIMAP}
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+minimap <- ggplot(data = world) +
+  geom_sf(color = NA, fill = "grey") + 
+  geom_rect(xmin = 7, xmax = 30, 
+            ymin = -10, ymax = 6.5, 
+            fill = NA, color = "black") + 
+  coord_sf(xlim = c(-15, 50), 
+           ylim = c(-35, 35)) + 
+  theme_void() + 
+  theme(panel.border = element_rect(colour = "darkgrey", 
+                                    fill = NA, size = .5), 
+        panel.background = element_rect(fill = "white"))
+```
+
+
+
+# MAP
+
+```{r}
+p <- ggplot() + 
+  geom_tile(data = dem_df, aes(x = x, y = y, fill = z.class), color = NA) + 
+  geom_sf(data = ocean10, fill = "#dff1f9", color = NA) + 
+  geom_sf(data = sf::st_union(white) %>% st_crop(xmin = 6, xmax = 30, ymin = -10, ymax = 6.5), 
+          fill = "#00734d", color = NA, alpha = .4) + 
+  scale_fill_manual(values = c("#f2e6b699", 
+                               "#f4dc8199", 
+                               "#be8a3699",
+                               "#7f592199",
+                               "#442c0d99")) + 
+  geom_sf(data = coast10, size = .5, color = '#44afe3', fill = NA) + 
+  geom_sf(data = rivers10, size = .5, color = '#44afe3') + 
+  geom_sf(data = lakes10, fill = '#44afe3', color = NA) + 
+  geom_sf(data = boundary_lines_land10, color = 'white') + 
+  geom_sf(data = cng.watershed, fill = NA, color = "#283c5f", linetype = "dashed") + 
+  geom_sf(data = cb.comb, fill = NA, color = "#782172", linetype = "dashed") + 
+  geom_point(data = dplyr::filter(c14, FROM < 1000 & TO > -2000), 
+             aes(x = LONG, y = LAT), 
+             shape = 21, fill = "white", color = "black") + # only plot sites with dates from the 1st m. BCE
+  geom_label_repel(data = sites.text, 
+                   aes(x = LONG, y = LAT, label = SITE), 
+                   size = 2.5, 
+                   label.padding = 0.1, min.segment.length = 0, 
+                   fill = "black", color = "white") + 
+  geom_point(data = sites.text, aes(x = LONG, y = LAT), shape = 21, fill = "black", color = "white", size = 2) + 
+  scale_x_continuous(breaks = seq(0, 30, 2)) + 
+  ggsn::north(sites, 
+              anchor = c(x = 30, y = 6.6), 
+              scale = .05) + 
+  ggsn::scalebar(sites,
+                 location  = "topright",
+                 anchor = c(x = 28, y = 6.3),
+                 dist = 250, dist_unit = "km",
+                 transform = TRUE, model = "WGS84", 
+                 height = .005, st.dist = .01, 
+                 border.size = .1, st.size = 2) + 
+  # COUNTRY NAMES
+  annotate("text", x = 13, y = 6.2, label = "Cameroon", fontface  = "bold", colour = "#485063") + 
+  annotate("text", x = 21, y = 5.5, label = "Central Africa Rep.", fontface  = "bold", colour = "#485063") + 
+  annotate("text", x = 10.5, y = 1.5, label = "EG", fontface  = "bold", colour = "#485063") + 
+  annotate("text", x = 12, y = -1.25, label = "Gabon", fontface  = "bold", colour = "#485063") + 
+  annotate("text", x = 15.5, y = 0, label = "Rep. Congo", fontface  = "bold", colour = "#485063") + 
+  annotate("text", x = 20, y = -3, label = "Dem. Rep. Congo", fontface  = "bold", colour = "#485063") + 
+  annotate("text", x = 18, y = -9, label = "Angola", fontface  = "bold", colour = "#485063") + 
+  # RIVER NAMES
+  annotate("text", x = 22.25, y = 2.4, label = "CONGO", fontface  = "bold", colour = "white", size = 2) + 
+  annotate("text", x = 26.1, y = -2, label = "LUALABA", fontface  = "bold", colour = "white", size = 2, angle = -90) + 
+  annotate("text", x = 17.75, y = 2, label = "UBANGI", fontface  = "bold", colour = "white", size = 2, angle = 80) + 
+  annotate("text", x = 23, y = -.75, label = "TSHUAPA", fontface  = "bold", colour = "white", size = 2, angle = -25) + 
+  annotate("text", x = 25, y = 3.75, label = "UELE", fontface  = "bold", colour = "white", size = 2) + 
+  annotate("text", x = 19.5, y = -4.2, label = "KASAÏ", fontface  = "bold", colour = "white", size = 2, angle = -20) + 
+  annotate("text", x = 13, y = -.5, label = "OGOOUÉ", fontface  = "bold", colour = "white", size = 2, angle = -45) + 
+  annotate("text", x = 12.4, y = 5.1, label = "SANAGA", fontface  = "bold", colour = "white", size = 2, angle = 30) + 
+  annotate("text", x = 16, y = 4, label = "KADÉÏ", fontface  = "bold", colour = "white", size = 2, angle = -35) + 
+  # LEGEND
+  geom_segment(aes(x = 6.75, xend = 7.25, y = -2.9, yend = -2.9), 
+               color = "#782172", linetype = "dashed") + 
+  annotate("text", x = 7.35, y = -2.9, label = paste("Congo Basin"), hjust = 0, size = 2) + 
+  
+  geom_segment(aes(x = 6.75, xend = 7.25, y = -3.45, yend = -3.45), 
+               color = "#283c5f", linetype = "dashed") + 
+  annotate("text", x = 7.35, y = -3.3, label = paste("Drainage System of"), hjust = 0, size = 2) + 
+  annotate("text", x = 7.35, y = -3.6, label = paste("the Congo River"), hjust = 0, size = 2) + 
+  
+  geom_rect(aes(xmin = 6.75, xmax = 7.25, ymin = -4, ymax = -4.25), fill = "#00734d", alpha = .4) + 
+  annotate("text", x = 7.35, y = -4.1, label = paste("Rainforest"), hjust = 0, size = 2) + 
+  geom_rect(aes(xmin = 6.75, xmax = 7.25, ymin = -4.5, ymax = -4.75), fill = "#f2e6b699") + 
+  annotate("text", x = 7.35, y = -4.6, label = paste("0 - 200 m"), hjust = 0, size = 2) + 
+  geom_rect(aes(xmin = 6.75, xmax = 7.25, ymin = -5, ymax = -5.25), fill = "#f4dc8199") + 
+  annotate("text", x = 7.35, y = -5.1, label = paste("200 - 500 m"), hjust = 0, size = 2) + 
+  geom_rect(aes(xmin = 6.75, xmax = 7.25, ymin = -5.5, ymax = -5.75), fill = "#be8a3699") + 
+  annotate("text", x = 7.35, y = -5.6, label = paste("500 - 1000 m"), hjust = 0, size = 2) + 
+  geom_rect(aes(xmin = 6.75, xmax = 7.25, ymin = -6, ymax = -6.25), fill = "#7f592199") + 
+  annotate("text", x = 7.35, y = -6.1, label = paste("1000 - 2000 m"), hjust = 0, size = 2) +
+  geom_rect(aes(xmin = 6.75, xmax = 7.25, ymin = -6.5, ymax = -6.75), fill = "#442c0d99") + 
+  annotate("text", x = 7.35, y = -6.6, label = paste(">2000 m"), hjust = 0, size = 2) + 
+  coord_sf(xlim = c(7.5, 29), 
+           ylim = c(-9.2, 6), 
+           label_graticule = "SE") + 
+  theme_bw() + 
+  theme(legend.position = "none",
+        panel.grid = element_blank(), 
+        axis.title = element_blank())
+
+p.map <- cowplot::ggdraw() +
+  draw_plot(p) +
+  draw_plot(minimap, 
+            x = .01, y = .065, width = .15, height = .15)
+
+ggsave("figures/fig1.jpg", p.map, width = 8, height = 5.5)
+```
+> TODO: insert 500 m aNN contrurline
+srtm <- raster::raster("input/strm30/Africa_merge.tif")
+e  <- extent(7, 30, -10, 10) 
+srtm <- crop(srtm, e) 
+  
+# Fig. 2
+
+## P. glaucum
+Radiocarbon dates on or in associatio *Pennisetum glaucum*
+
+```{r}
+timerange <- c(6000, 1000)
+```
+
+
+```{r}
+c14.pg <- c14 %>%
+  dplyr::filter(MATERIAL == "Charcoal_seed_Pennisetum glaucum" |
+                grepl("Pg", FRUIT))
+c14.pg
+spd.pg <- rc.spd(c14.data = c14.pg, timeRange = timerange, median = T)
+spd.pg$kde$CLASS <- "PG"
+spd.pg$spd$CLASS <- "PG"
+spd.pg.median <- data.frame(median = spd.pg$median)
+spd.pg.median$CLASS <- "PG"
+```
+
+## Elaeis guineensis
+
+```{r}
+c14.eg <- c14 %>%
+  dplyr::filter((MATERIAL == "Charcoal_endocarp_elaeis" |
+                grepl("Eg", FRUIT)) & 
+                  C14AGE > 0 & !is.na(C14STD))
+c14.eg
+spd.eg <- rc.spd(c14.data = c14.eg, timeRange = timerange, median = T)
+spd.eg$kde$CLASS <- "EG"
+spd.eg$spd$CLASS <- "EG"
+spd.eg.median <- data.frame(median = spd.eg$median)
+spd.eg.median$CLASS <- "EG"
+```
+
+## Canarium schweinfurthii
+
+```{r}
+c14.cs <- c14 %>%
+  dplyr::filter(MATERIAL == "Charcoal_endocarp_canarium" |
+                grepl("Cs", FRUIT))
+c14.cs
+spd.cs <- rc.spd(c14.data = c14.cs, timeRange = timerange, median = T)
+spd.cs$kde$CLASS <- "CS"
+spd.cs$spd$CLASS <- "CS"
+spd.cs.median <- data.frame(median = spd.cs$median)
+spd.cs.median$CLASS <- "CS"
+```
+
+## Ovicaprines
+
+```{r}
+c14.oc <- c14 %>%
+  #dplyr::filter(grepl("Capra/Ovis", ZOO))
+  dplyr::filter(LABNR %in% c("Gif-11155", "Lv-1939", "Lv-1940", "Lv-1941"))
+c14.oc
+spd.oc <- rc.spd(c14.data = c14.oc, timeRange = timerange, median = T)
+spd.oc$kde$CLASS <- "oc"
+spd.oc$spd$CLASS <- "oc"
+spd.oc.median <- data.frame(median = spd.oc$median)
+spd.oc.median$CLASS <- "oc"
+```
+
+```{r}
+spd <- rbind(spd.pg$spd, 
+             spd.eg$spd, 
+             spd.cs$spd)
+
+median <- rbind(spd.pg.median, 
+                spd.eg.median, 
+                spd.cs.median)
+
+spd.plt <- ggplot(spd, 
+                  aes(x = calBCAD, 
+                      y = grid.PrDens)) + 
+  geom_area(fill = "white", color = "black") + 
+  geom_point(data = dplyr::filter(median, median > -2500 & median < 1000),
+             aes(x = median,
+                 y = 0, 
+                 color = median), 
+             shape = "|",
+             size = 8) + 
+  facet_grid(CLASS~.) +
+  scale_color_viridis() + 
+  scale_x_continuous("Cal BCE/CE", 
+                     limits = c(-2350, 1100), 
+                     expand = c(0, 0)) + 
+  scale_y_continuous("Summed Probability", 
+                     limits = c(0, 1.1*max(spd$grid.PrDens)),
+                     expand = c(0, 0)) +
+  theme_bw() + 
+  theme(strip.background = element_blank(),
+        strip.text = element_blank(),
+        panel.grid.major.y = element_blank(), 
+        panel.grid.minor.y = element_blank(), 
+        legend.position = "none")
+```
+
+## Map
+
+```{r}
+uq.sites <- function(x, meta){
+  x <- x %>% 
+    dplyr::group_by(SITE, LAT, LONG) %>%
+    dplyr::summarise(max = min(MEDIAN))
+  x$CLASS <- meta
+  return(x)
+}
+
+sites2 <- rbind(uq.sites(dplyr::filter(c14.pg, TO > -2500 & TO < 1000), "Pennisetum glaucum"),
+                uq.sites(dplyr::filter(c14.eg, TO > -2500 & TO < 1000), "Elaeis guineensis"), 
+                uq.sites(dplyr::filter(c14.cs, TO > -2500 & TO < 1000), "Canarium schweinfurthii"))
+
+map.plt <- basemap + 
+  #ggplot() +  #geom_sf(data = sites, aes(color = max)) + 
+  geom_point(data = sites2, aes(x = LONG, y = LAT, fill = max), shape = 21, color = "black", size = 2) + 
+  facet_wrap(CLASS ~ .,
+             dir = "v") + 
+  scale_fill_viridis() + 
+  scale_x_continuous(" ") + 
+  scale_y_continuous(" ", breaks = seq(10, -10, -5)) + 
+  coord_sf(xlim = c(7.5, 29), 
+           ylim = c(-9.2, 6)) + 
+  theme_bw() + 
+  theme(#strip.text.y.left = element_text(angle = 0),
+        legend.position = "none", 
+        panel.grid = element_blank())
+```
+
+```{r}
+labs <- cowplot::plot_grid(NULL, NULL, NULL, NULL, 
+                           labels = c("a", "b", "c", ""), 
+                           ncol = 1, 
+                           rel_heights = c(1, 1, 1, .15))
+cowplot::plot_grid(labs, 
+                   map.plt, 
+                   spd.plt, 
+                   nrow = 1,
+                   rel_widths = c(.06, 2, 1))
+ggsave("figures/fig2.jpg", width = 8, height = 10)
+```
+
+
+## zoology map
+
+```{r}
+fig3.b <- ggplot(spd.oc$spd,
+       aes(x = calBCAD, 
+       y = grid.PrDens)) + 
+  geom_area(fill = "white", color = "black") + 
+  geom_point(data = dplyr::filter(spd.oc.median, median > -2500 & median < 1000),
+             aes(x = median,
+                 y = 0, 
+                 color = median), 
+             shape = "|",
+             size = 8) + 
+  facet_grid(CLASS~.) +
+  scale_color_viridis(limits = c(min(median$median), max(median$median))) + 
+  scale_x_continuous("Cal BCE/CE", 
+                     limits = c(-2350, 1100), 
+                     expand = c(0, 0)) + 
+  scale_y_continuous("Summed Probability", 
+                     limits = c(0, 1.1*max(spd$grid.PrDens)),
+                     expand = c(0, 0)) +
+  theme_bw() + 
+  theme(strip.background = element_blank(),
+        strip.text = element_blank(),
+        panel.grid.major.y = element_blank(), 
+        panel.grid.minor.y = element_blank(), 
+        legend.position = "none")
+
+fig3.a <- basemap + 
+  geom_point(data = uq.sites(dplyr::filter(c14.oc, TO > -2500 & TO < 1000), "Ovicaprine"), 
+             aes(x = LONG, y = LAT, fill = max), shape = 21, color = "black", size = 2) + 
+  facet_wrap(CLASS ~ .,
+             dir = "v") + 
+  scale_fill_viridis(limits = c(min(sites2$max), max(sites2$max))) + 
+  scale_x_continuous(" ") + 
+  scale_y_continuous(" ", breaks = seq(10, -10, -5)) + 
+  coord_sf(xlim = c(7.5, 29), 
+           ylim = c(-9.2, 6)) + 
+  theme_bw() + 
+  theme(#strip.text.y.left = element_text(angle = 0),
+        legend.position = "none", 
+        panel.grid = element_blank())
+
+cowplot::plot_grid(fig3.a, 
+                   fig3.b, 
+                   ncol = 2,
+                   rel_widths = c(2, 1))
+ggsave("figures/fig3.jpg", width = 8, height = 4)
+```
